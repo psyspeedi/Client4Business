@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Реле: один домен, два подпути под секретным префиксом.
+#
+#   https://@@ORIGIN@@/r/@@PREFIX@@/tg      →  api.telegram.org
+#   https://@@ORIGIN@@/r/@@PREFIX@@/or/v1   →  openrouter.ai/api/v1
+#
+# Ставится ОДИН раз на сервер, у которого есть доступ к обоим сервисам.
+# Машина со стендом после этого ходит обычным HTTPS на этот адрес — ни
+# туннеля, ни VPN на ней нет.
+#
+# Префикс нужен, потому что адрес реле лежит в репозитории: корень домена
+# отвечает пустотой, и случайный сканер за ним ничего не находит. От того,
+# кому репозиторий отдан, префикс не защищает — это осознанный размен.
+#
+#   sudo cp relay/nginx.conf /etc/nginx/sites-available/openclaw-relay
+#   sudo ln -s /etc/nginx/sites-available/openclaw-relay /etc/nginx/sites-enabled/
+#   sudo certbot certonly --dns-cloudflare -d @@HOST@@
+#   sudo nginx -t && sudo systemctl reload nginx
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Зона для limit_req. Файл подключается внутрь http{}, поэтому объявление
+# зоны живёт здесь же, рядом с правилами, которые её используют.
+limit_req_zone $binary_remote_addr zone=relay:10m rate=10r/s;
+
+server {
+    listen @@PORT@@ ssl;
+    listen [::]:@@PORT@@ ssl;
+    http2 on;
+    server_name @@HOST@@;
+
+    ssl_certificate     /etc/letsencrypt/live/@@HOST@@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@@HOST@@/privkey.pem;
+
+    # Файлы из Bot API (getFile → /file/bot<token>/…) весят до 20 МБ,
+    # а загрузка sendDocument — до 50 МБ.
+    client_max_body_size 64m;
+
+    # Всё, что не под префиксом, — закрываем без ответа.
+    location / { return 444; }
+
+    # ── Telegram Bot API ─────────────────────────────────────────────────────
+    location /r/@@PREFIX@@/tg/ {
+        proxy_pass https://api.telegram.org/;
+        proxy_ssl_server_name on;
+        proxy_set_header Host api.telegram.org;
+
+        # getUpdates — long polling: соединение держится десятками секунд,
+        # ответ должен идти потоком, а не копиться в буфере.
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        limit_req zone=relay burst=40 nodelay;
+    }
+
+    # ── OpenRouter ───────────────────────────────────────────────────────────
+    location /r/@@PREFIX@@/or/ {
+        proxy_pass https://openrouter.ai/api/;
+        proxy_ssl_server_name on;
+        proxy_set_header Host openrouter.ai;
+
+        # Ответы модели приходят по SSE — буферизация ломает стриминг.
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+
+        limit_req zone=relay burst=20 nodelay;
+    }
+}

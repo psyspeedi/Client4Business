@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenClaw Gateway + Telegram.
+#
+#   Доступ к заблокированным эндпоинтам решается НЕ туннелем на этой машине,
+#   а reverse proxy на своём VPS (см. relay/). Контейнер ходит на свои домены
+#   обычным HTTPS: Bot API — через channels.telegram.apiRoot, LLM — через
+#   models.providers.openrouter.baseUrl. Ни TUN, ни sidecar, ни capabilities.
+#
+#   Если реле не задано (пустые TELEGRAM_API_ROOT / OPENROUTER_BASE_URL),
+#   стек работает напрямую с api.telegram.org и openrouter.ai — так его
+#   запустит любой, у кого эти адреса открыты.
+#
+#   Порядок запуска:  openclaw-init → openclaw
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-openclaw-env: &openclaw-env
+  HOME: /home/node
+  OPENCLAW_HOME: /home/node
+  # Пути внутри контейнера фиксируем, чтобы хостовые значения из .env
+  # не протекли в рантайм.
+  OPENCLAW_STATE_DIR: /home/node/.openclaw
+  OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+  OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+  OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+  OPENCLAW_GATEWAY_PORT: "18789"
+  OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?задайте OPENCLAW_GATEWAY_TOKEN в .env (make init генерирует)}
+  OPENCLAW_DISABLE_BONJOUR: "1"
+  TERM: xterm-256color
+  TZ: ${TZ:-UTC}
+
+  # ── Секреты и каналы ──────────────────────────────────────────────────────
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?задайте TELEGRAM_BOT_TOKEN в .env}
+  TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID:-}
+  TELEGRAM_DM_POLICY: ${TELEGRAM_DM_POLICY:-allowlist}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?задайте OPENROUTER_API_KEY в .env}
+  LLM_MODEL: ${LLM_MODEL:-openrouter/auto}
+  TOOLS_PROFILE: ${TOOLS_PROFILE:-minimal}
+
+  # ── Реле (пусто = ходим напрямую) ─────────────────────────────────────────
+  TELEGRAM_API_ROOT: ${TELEGRAM_API_ROOT:-}
+  OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-}
+
+  # ── Прокси (запасной путь; обычно пусто — реле его заменяет) ──────────────
+  # Пустое значение undici игнорирует, так что переменные безвредны.
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  http_proxy: ${HTTP_PROXY:-}
+  https_proxy: ${HTTPS_PROXY:-}
+  NO_PROXY: 127.0.0.1,localhost,::1,host.docker.internal,.local,.internal
+  no_proxy: 127.0.0.1,localhost,::1,host.docker.internal,.local,.internal
+
+x-openclaw-volumes: &openclaw-volumes
+  - openclaw-state:/home/node/.openclaw
+  - openclaw-auth:/home/node/.config/openclaw
+  - ./openclaw:/bootstrap:ro
+
+services:
+  # ── 1. Одноразовый headless-бутстрап ───────────────────────────────────────
+  openclaw-init:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    # root нужен один раз: named volume создаётся с владельцем root,
+    # bootstrap.sh отдаёт его пользователю node и переключается сам.
+    user: "0:0"
+    entrypoint: ["/bin/sh"]
+    command: ["/bootstrap/bootstrap.sh"]
+    environment: *openclaw-env
+    volumes: *openclaw-volumes
+    restart: "no"
+
+  # ── 2. Gateway ─────────────────────────────────────────────────────────────
+  openclaw:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    depends_on:
+      openclaw-init:
+        condition: service_completed_successfully
+    environment: *openclaw-env
+    volumes: *openclaw-volumes
+    # Control UI — только на loopback хоста, авторизация по токену.
+    ports:
+      - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    # bind=lan: внутри контейнера слушаем 0.0.0.0, наружу порт открывает
+    # только проброс выше. На loopback контейнера docker-proxy не достучится.
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    healthcheck:
+      test: ["CMD", "node", "dist/docker-healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── 3. CLI по требованию: `make cli ARGS="..."` ────────────────────────────
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    profiles: ["cli"]
+    environment:
+      <<: *openclaw-env
+      BROWSER: echo
+    volumes: *openclaw-volumes
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "dist/index.js"]
+
+volumes:
+  openclaw-state:
+  openclaw-auth:

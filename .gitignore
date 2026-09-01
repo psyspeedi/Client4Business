@@ -1,0 +1,10 @@
+# секреты
+.env
+.env.*
+!.env.example
+
+# конфиги реле собираются из relay/*.template и содержат домен и
+# секретный префикс — в репозитории живут только шаблоны
+relay/nginx.conf
+relay/Caddyfile
+*.local.conf

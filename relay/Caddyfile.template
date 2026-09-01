@@ -1,0 +1,39 @@
+# То же реле на Caddy: сертификат Let's Encrypt выпускается и продлевается
+# сам, конфигурировать TLS не нужно.
+#
+#   sudo cp relay/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+
+@@HOST@@:@@PORT@@ {
+	request_body {
+		max_size 64MB
+	}
+
+	# ── Telegram Bot API ─────────────────────────────────────────────────
+	handle_path /r/@@PREFIX@@/tg/* {
+		reverse_proxy https://api.telegram.org {
+			header_up Host api.telegram.org
+			# long polling getUpdates
+			transport http {
+				read_timeout 300s
+			}
+		}
+	}
+
+	# ── OpenRouter ───────────────────────────────────────────────────────
+	handle_path /r/@@PREFIX@@/or/* {
+		rewrite * /api{uri}
+		reverse_proxy https://openrouter.ai {
+			header_up Host openrouter.ai
+			# SSE-стриминг ответов модели
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+			}
+		}
+	}
+
+	# Всё остальное — закрываем.
+	handle {
+		abort
+	}
+}
